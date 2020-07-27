@@ -1,13 +1,12 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Data;
-using System.Data.SqlClient;
-using System.IO;
-using System.Linq;
-using System.Text;
+using System.Runtime.CompilerServices;
+using System.Threading;
 using System.Threading.Tasks;
-using Microsoft.WindowsAzure.Storage;
-using Microsoft.WindowsAzure.Storage.Blob;
+using Azure.Storage.Blobs;
+using Azure.Storage.Blobs.Specialized;
+using Microsoft.Data.SqlClient;
 using ShellProgressBar;
 
 namespace SitecoreSqlServerToAzureStorageBlobCopy
@@ -16,101 +15,69 @@ namespace SitecoreSqlServerToAzureStorageBlobCopy
     {
         static async Task Main(string[] args)
         {
-            const string connectionString = "data source=DESKTOP-0LFEV64\\SQLEXPRESS;initial catalog=TestInstanceSitecore_Master;integrated security=True;MultipleActiveResultSets=True";
+            var storageAccount = Environment.GetEnvironmentVariable("AZURE_STORAGE_CONNECTION_STRING");
 
-            var storageAccount = CloudStorageAccount.Parse("UseDevelopmentStorage=true");
-
-            var blobClient = storageAccount.CreateCloudBlobClient();
-            var blobContainer = blobClient.GetContainerReference("blobs");
-            await blobContainer.CreateIfNotExistsAsync();
-
-            using (var connection = new SqlConnection(connectionString))
+            var options = new ProgressBarOptions
             {
-                await connection.OpenAsync();
+                CollapseWhenFinished = false
+            };
+            using var progressBar = new ProgressBar(0, "progress bar is on the bottom now", options);
+            var blobServiceClient = new BlobServiceClient(storageAccount);
+            var blobContainerClient = blobServiceClient.GetBlobContainerClient("blobs");
+            await blobContainerClient.CreateIfNotExistsAsync().ConfigureAwait(true);
 
-                var counts = new Dictionary<Guid, long>();
-                using (var command = connection.CreateCommand())
-                {
-                    command.CommandText = "SELECT BlobId, SUM(DATALENGTH(Data)) FROM Blobs GROUP BY BlobId";
-                    using (var reader = await command.ExecuteReaderAsync(CommandBehavior.SequentialAccess))
-                    {
-                        while (await reader.ReadAsync())
-                        {
-                            counts.Add(reader.GetGuid(0), reader.GetInt32(1));
-                        }
-                    }
-                }
+            var tasks = new List<Task>();
 
-                using (var command = connection.CreateCommand())
-                {
-
-                    var options = new ProgressBarOptions
-                    {
-                        CollapseWhenFinished = false
-                    };
-                    using (var progressBar = new ProgressBar(counts.Count, "progress bar is on the bottom now", options))
-                    {
-                        command.CommandText = "SELECT BlobId, Data FROM Blobs ORDER BY BlobId, [Index]";
-
-
-                        Guid? currentBlobId = null;
-                        Stream cloubBlobStream = null;
-                        ChildProgressBar childProgressBar = null;
-
-                        var progress = new Progress<long>();
-                        long bytesWritten = 0;
-                        progress.ProgressChanged += (sender, l) =>
-                        {
-                            bytesWritten += l;
-                            childProgressBar.Tick((int)bytesWritten); 
-
-                        };
-
-                        using (var reader = await command.ExecuteReaderAsync(CommandBehavior.SequentialAccess))
-                        {
-                            while (await reader.ReadAsync())
-                            {
-                                var blobId = reader.GetGuid(0);
-                                if (blobId != currentBlobId)
-                                {
-                                    cloubBlobStream?.Close();
-                                    childProgressBar?.Dispose();
-                                    bytesWritten = 0;
-
-                                    progressBar.Tick($"Copying blob {progressBar.CurrentTick+1} of {progressBar.MaxTicks}");
-                                    childProgressBar = progressBar.Spawn((int) counts[blobId], blobId.ToString(), options);
-                                    cloubBlobStream = await blobContainer
-                                        .GetBlockBlobReference((currentBlobId = blobId).ToString()).OpenWriteAsync();
-                                }
-
-                                using (var dataStream = reader.GetStream(1))
-                                {
-                                    await Copy(dataStream, cloubBlobStream, progress);
-                                }
-
-                            }
-                        }
-
-                        cloubBlobStream?.Close();
-                        childProgressBar?.Dispose();
-                    }
-                }
+            await foreach (var blob in GetBlobs())
+            {
+                progressBar.MaxTicks += 1;
+                var blobName = blob.Id.ToString();
+                // progressBar.Tick($"Copying blob {progressBar.CurrentTick + 1} of {progressBar.MaxTicks}");
+                var childProgressBar = progressBar.Spawn((int)blob.Size, blobName, options);
+                tasks.Add(CreateBlobAsync(blob.Id, blobContainerClient.GetBlockBlobClient(blobName),
+                    childProgressBar.AsProgress<long>(null, l => l / (double)blob.Size)));
             }
+
+            await Task.WhenAll(tasks.ToArray()).ConfigureAwait(true);
         }
 
-
-        private static async Task Copy(Stream source, Stream destination, IProgress<long> progress)
+        private static async IAsyncEnumerable<(Guid Id, long Size)> GetBlobs([EnumeratorCancellation] CancellationToken cancellationToken = default)
         {
-            var buffer = new byte[16 * 1024];
+            await using var connection = new SqlConnection(ConnectionString);
+            await using var command = connection.CreateCommand();
+            command.CommandText = "SELECT BlobId, SUM(DATALENGTH(Data)) FROM Blobs GROUP BY BlobId";
+            await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+                yield return (reader.GetGuid(0), reader.GetInt32(1));
+        }
 
-            long bytesWritten = 0;
-            int read;
-            while ((read = source.Read(buffer, 0, buffer.Length)) != 0)
+        public static string ConnectionString { get; set; }
+
+        private static async Task CreateBlobAsync(Guid id, BlockBlobClient blockBlobClient, IProgress<long> progress,
+            CancellationToken cancellationToken = default)
+        {
+            await using var connection = new SqlConnection(ConnectionString);
+            await using var command = connection.CreateCommand();
+            command.CommandText = "SELECT [Index], Data FROM Blobs ORDER BY [Index] WHERE BlobId = @p0";
+            command.Parameters.Add(id);
+
+            await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
+            await using var reader = await command
+                .ExecuteReaderAsync(CommandBehavior.SequentialAccess, cancellationToken).ConfigureAwait(false);
+
+            var base64BlockIds = new List<string>();
+            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
-                await destination.WriteAsync(buffer, 0, read);
-                bytesWritten += read;
-                progress.Report(bytesWritten);
+                var base64BlockId = Convert.ToBase64String(BitConverter.GetBytes(reader.GetInt32(0)));
+                await using var source = reader.GetStream(1);
+                await blockBlobClient.StageBlockAsync(base64BlockId, source, null, null, progress, cancellationToken)
+                    .ConfigureAwait(false);
+                base64BlockIds.Add(base64BlockId);
             }
+
+            await blockBlobClient.CommitBlockListAsync(base64BlockIds, cancellationToken: cancellationToken)
+                .ConfigureAwait(false);
         }
     }
 }
