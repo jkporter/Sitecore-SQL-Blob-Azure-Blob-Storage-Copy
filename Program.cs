@@ -1,4 +1,6 @@
 ﻿using System;
+using System.Buffers;
+using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Data;
@@ -30,20 +32,20 @@ namespace SitecoreSqlServerToAzureStorageBlobCopy
 
             var tasks = new List<Task>();
 
-            await foreach (var (id, _, size) in GetBlobs())
+            await foreach (var (id, partitions, size) in GetBlobs())
             {
                 progressBar.MaxTicks += 1;
                 var blobName = id.ToString();
                 // progressBar.Tick($"Copying blob {progressBar.CurrentTick + 1} of {progressBar.MaxTicks}");
                 var childProgressBar = progressBar.Spawn((int)size, blobName, options);
-                tasks.Add(CreateBlockBlobAsync(id, blobContainerClient.GetBlockBlobClient(blobName),
+                tasks.Add(CreateBlockBlobAsync(id, partitions, blobContainerClient.GetBlockBlobClient(blobName),
                     childProgressBar.AsProgress<long>(null, l => l / (double)size)));
             }
 
             await Task.WhenAll(tasks);
         }
 
-        private static async IAsyncEnumerable<(Guid Id, int Partions, long Size)> GetBlobs([EnumeratorCancellation] CancellationToken cancellationToken = default)
+        private static async IAsyncEnumerable<(Guid Id, int Partitions, long Size)> GetBlobs([EnumeratorCancellation] CancellationToken cancellationToken = default)
         {
             await using var connection = new SqlConnection(ConnectionString);
             await using var command = connection.CreateCommand();
@@ -56,7 +58,7 @@ namespace SitecoreSqlServerToAzureStorageBlobCopy
 
         public static string ConnectionString { get; set; }
 
-        private static async Task CreateBlockBlobAsync(Guid id, BlockBlobClient blockBlobClient, IProgress<long> progress,
+        private static async Task CreateBlockBlobAsync(Guid id, int? partitions, BlockBlobClient blockBlobClient , IProgress<long> progress,
             CancellationToken cancellationToken = default)
         {
             await using var connection = new SqlConnection(ConnectionString);
@@ -68,10 +70,12 @@ namespace SitecoreSqlServerToAzureStorageBlobCopy
             await using var reader = await command
                 .ExecuteReaderAsync(CommandBehavior.SequentialAccess, cancellationToken);
 
-            var base64BlockIds = new List<string>();
+            var base64BlockIds = partitions.HasValue ? new List<string>(partitions.Value) : new List<string>();
+            var indexBytes = new byte[4];
             while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
-                var base64BlockId = Convert.ToBase64String(BitConverter.GetBytes(reader.GetInt32(0)));
+                BinaryPrimitives.WriteInt32BigEndian(indexBytes, reader.GetInt32(0));
+                var base64BlockId = Convert.ToBase64String(indexBytes);
                 await using var source = reader.GetStream(1);
                 await blockBlobClient.StageBlockAsync(base64BlockId, source, null, null, progress, cancellationToken);
                 base64BlockIds.Add(base64BlockId);
@@ -107,10 +111,9 @@ namespace SitecoreSqlServerToAzureStorageBlobCopy
 
             await reader.ReadAsync(cancellationToken);
 
-            var indexBytes = BitConverter.GetBytes(index);
-            if (BitConverter.IsLittleEndian)
-                Array.Reverse(indexBytes);
-            var base64BlockId = Convert.ToBase64String(indexBytes);
+            var indexBytes = MemoryPool<byte>.Shared.Rent(4).Memory[..4];
+            BinaryPrimitives.WriteInt32BigEndian(indexBytes.Span, reader.GetInt32(0));
+            var base64BlockId = Convert.ToBase64String(indexBytes.Span);
             await using var source = reader.GetStream(1);
             await blockBlobClient.StageBlockAsync(base64BlockId, source, null, null, progress, cancellationToken);
 
